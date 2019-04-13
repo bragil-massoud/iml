@@ -1,0 +1,171 @@
+---
+title: "iml for keras: Interpretable Deep Learning in R"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{iml for keras: Interpretable Deep Learning in R}
+  %\VignetteEngine{knitr::rmarkdown}
+  \usepackage[utf8]{inputenc}
+---
+
+```{r, echo = FALSE, message = FALSE}
+knitr::opts_chunk$set(collapse = T, comment = "#>", fig.width = 7, fig.height = 7, fig.align = "center")
+options(tibble.print_min = 4L, tibble.print_max = 4L)
+```
+
+Neural networks are becoming the most frequenly used machine learning method, not only for image analysis and natural language processing but also for more classical problems. However, the tooling around neural network explainablility is still severely lacking.
+
+While this package supports neural networks built with keras out-of-the-box, due to the matrix oriented nature of the keras api it is still worthwhile to show an example. We will use the Boston housing data to perform a regression. Next we take a look at two more involved examples that showcase mutliple inputs and outputs, two features that are relatively unique to keras.
+
+If you want to learn more about the technical details of all the methods, read chapters from: https://christophm.github.io/interpretable-ml-book/agnostic.html
+
+## Data: Boston Housing
+
+We'll use the `MASS::Boston` dataset to show how to explain models build with keras. This dataset contains median house values from Boston neighbourhoods. 
+
+```{r}
+data("Boston", package  = "MASS")
+head(Boston)
+```
+
+## Preparing the data for keras
+
+Keras works with matrices (tensors to be more precises but they are mapped to R matrices by the keras and reticulate packages). Usually our data will be represented by R data.frames/data.tables/tibbles, so we first have to convert it.
+If your data is purely numeric, or if categorical features have already been coded you could use R's as.matrix method to convert your data.frame to a matrix. In all other cases it is more convenient to use model.matrix which automatically takes care of coding factors.
+The boston data is purely numeric but we still use model.matrix to make it easier to reuse this example for other datasets.
+We will use all features and no intercept variable (because neural networks have their own bias weights) as input and predict the median value (medv). We skip using a validation set here because our goal is not to estimate model accuracy. Neural networks are quite sensitive to differently scaled input variables so we use the scale function here to standardize all input columns to zero mean and standard deviation of 1.0.
+
+```{r, message = FALSE}
+train_x = model.matrix(medv ~ . - 1, Boston)
+train_x = scale(train_x)
+train_y = Boston$medv
+
+head(train_x)
+```
+
+## Fitting the machine learning model
+
+First we develop a simple toy neural network to predict the Boston median housing value. We will got with two small layers and a linear output
+and mean squared error as the loss. 
+
+```{r, message = FALSE}
+set.seed(42)
+library("iml")
+library("keras")
+
+model.regression = keras_model_sequential() %>% 
+  layer_dense(units = 4, activation = 'tanh', input_shape = ncol(train_x)) %>% 
+  layer_dense(units = 3, activation = 'tanh') %>% 
+  layer_dense(units = 1, activation = 'linear') %>%
+  compile(loss = 'mean_squared_error',
+          optimizer = optimizer_rmsprop(),
+          metrics = c('mean_squared_error'))
+
+model.regression %>%
+  fit(x = train_x, y = train_y, epochs = 25 , batch_size = 20, validation_split = 0, verbose = 0)
+```
+
+## Using the iml Predictor() container
+
+We create a `Predictor` object, that holds the model and the data. Because iml's internals are build around data.frames, we have to convert the training data back to a data.frame.
+
+```{r}
+train_x_df = as.data.frame(train_x)
+predictor = Predictor$new(model.regression, data = train_x_df, y = train_y)
+```
+
+
+## Feature importance
+
+We can measure how important each feature was for the predictions with `FeatureImp`. The feature importance measure works by shuffling each feature and measuring how much the performance drops. For this regression task we choose to measure the loss in performance with the mean absolute error ('mae'), another choice would be the  mean squared error ('mse').
+
+
+Once we create a new object of `FeatureImp`, the importance is automatically computed. 
+We can call the `plot()` function of the object or look at the results in a data.frame.
+```{r}
+imp = FeatureImp$new(predictor, loss = "mae")
+plot(imp)
+imp$results
+```
+
+## Other descriptors
+
+Besides knowing which features were important, the iml package offers tools to investigate feature effects and interactions. Using lime and shapely values, it is even possible to get a detailed look at single predictions and how they are affected by the features. See the general iml vignette for more information.
+
+## Multiple Inputs & Outputs
+
+Neural networks, through their user defined architecture, offer a lot of flexibility. Two such areas are multiple inputs and multiple outputs. These architectures don't fit naturally  into the api provided by iml, but there are easy workarounds.
+
+### Multiple Inputs
+Multiple inputs can arise when the inputs features have different domains, e.g. one matrix for continous features coded as floats and a separate matrix for sparse indices for word embeddings.
+
+Let's stick to the Boston data and change how we treat the "rad" variable. In the boston data it refers to an index of transportation accessability, but let's prerend it encodes a high dimensional (many valued) categorial variable. Usually we would dummy encode this variable by making sure it is a factor and then calling model.matrix. Another way to treat such a variable in neural networks is to directly use the integer value as an index into a look up table of n-dimensional vectors within the neural network. This trick gets even more important if you have a more complex situation with e.g. multiple values of this feature belonging to one instance, as the lookup table can be shared across these multiple uses and jointly learned during backpropagation.
+
+
+Let's first split the data as into a float matrix for all features execept "rad" and an integer matrix of width 1 for "rad" only. We scale the normal features as before and leave the rad feature untouched as it will be used as an index.
+
+```{r, message = FALSE}
+
+train_x = model.matrix(medv ~ . - rad - 1, Boston)
+train_x = scale(train_x)
+
+train_rad = as.matrix(Boston$rad - 1) # keras thinks in zero index
+
+train_y = Boston$medv
+```
+
+Next, we create a network architecture that work on these two inputs. We create two separate input layers, process one of them through
+an embedding layer and then concatenate them together.
+
+```{r, message = FALSE}
+set.seed(23)
+
+main_input <- layer_input(shape = ncol(train_x), dtype = 'float32', name = 'main_input')
+
+rad_input <- layer_input(shape = ncol(train_rad), dtype = 'int32', name = 'rad_input')
+rad_embedding <- rad_input %>%
+  layer_embedding(input_dim = max(Boston$rad), output_dim = 3, input_length = 1) %>%
+  layer_flatten
+
+output <- layer_concatenate(c(main_input, rad_embedding)) %>%
+  layer_dense(units = 4, activation = 'tanh') %>% 
+  layer_dense(units = 3, activation = 'tanh') %>% 
+  layer_dense(units = 1, activation = 'linear')
+
+model_two_inputs <- keras_model(
+  inputs = c(main_input, rad_input),
+  outputs = c(output)
+)
+
+model_two_inputs = model_two_inputs %>%
+  compile(loss = 'mean_squared_error',
+          optimizer = optimizer_rmsprop(),
+          metrics = c('mean_squared_error'))
+```
+
+Let's fit the model, passing both inputs. This style of passing the two inputs as a list will also be required for prediction with this model.
+
+```{r, message = FALSE}
+model_two_inputs %>%
+  fit(x = list(train_x, train_rad), y = train_y, epochs = 25 , batch_size = 20, validation_split = 0, verbose = 0)
+```
+
+The built in support for keras in iml only handles one input. However, we can easily fit the data into one data.frame and provide a custom prediction function to iml that splits it up into two inputs. At the same time we take care of converting the data.frames into matrices for keras.
+
+```{r, message =  FALSE}
+train_x_and_rad = data.frame(train_x, train_rad)
+predictor = Predictor$new(model_two_inputs, data = train_x_and_rad, y = train_y,
+                          predict.fun=function(model, newdata){
+                            pred = predict(model, list(as.matrix(newdata[,1:ncol(train_x)]),
+                                                          as.matrix(newdata[,(ncol(train_x) + 1):(ncol(newdata))])))
+                           
+                            data.frame(medv = pred)
+})
+```
+
+```{r}
+imp = FeatureImp$new(predictor, loss = "mae")
+plot(imp)
+imp$results
+```
+
+### Multiple Outputs (multi-task learning)
